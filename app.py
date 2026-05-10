@@ -72,33 +72,23 @@ WEIGHTS_PATH = Path(__file__).parent / "Weights"
 # SIDEBAR CONFIGURATION
 # ============================================================================
 with st.sidebar:
-    st.header("⚙️ Settings")
-    
-    st.subheader("Model Configuration")
-    device = st.selectbox(
-        "Device",
-        ["cuda" if torch.cuda.is_available() else "cpu", "cpu"],
-        index=0 if torch.cuda.is_available() else 1
-    )
-    
-    use_quantization = st.checkbox(
-        "Use 4-bit Quantization",
-        value=torch.cuda.is_available(),
-        help="Reduces memory usage. Recommended for GPU with limited VRAM."
-    )
-    
-    st.divider()
-    st.subheader("About This App")
+    st.header("ℹ️ About This App")
     st.info("""
     **Document to Markdown Converter**
     
     This app uses a fine-tuned Vision Language Model (Qwen2-VL-2B-Instruct) 
     with QLoRA to convert document images into structured Markdown format.
     
+    **How it works:**
+    1. Upload an image of your document
+    2. Model loads on first use (2-3 minutes)
+    3. Click Convert to generate Markdown
+    4. Download the result
+    
     **Features:**
     - Preserves formatting (headings, lists, tables)
     - Handles equations and special characters
-    - Works with PDF/PNG/JPG documents
+    - Optimized for Streamlit Cloud
     """)
 
 # ============================================================================
@@ -232,85 +222,57 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Initialize session state for model
+# Initialize session state for model (lazy loading)
 if 'model_loaded' not in st.session_state:
     st.session_state.model_loaded = False
     st.session_state.model = None
     st.session_state.processor = None
     st.session_state.device = None
-    st.session_state.load_error = None
-
-# Load model with graceful error handling
-if not st.session_state.model_loaded:
-    with st.spinner("⏳ Loading AI model for the first time (this may take 2-3 minutes)..."):
-        try:
-            logger.info("Attempting to load model...")
-            model, processor, device = load_model_and_processor()
-            
-            if model is not None and processor is not None:
-                st.session_state.model = model
-                st.session_state.processor = processor
-                st.session_state.device = device
-                st.session_state.model_loaded = True
-                st.session_state.load_error = None
-                st.success("✅ Model loaded successfully!")
-                st.rerun()
-            else:
-                st.session_state.load_error = "Model loading returned None"
-                st.error("❌ Failed to load model. Please try again later.")
-        except Exception as e:
-            error_msg = str(e)
-            st.session_state.load_error = error_msg
-            logger.error(f"Exception during model loading: {error_msg}", exc_info=True)
-            st.error(f"❌ Error loading model: {error_msg}")
-            st.info("💡 This may be due to limited resources. Please refresh the page in a few moments.")
-
-# Check if model is loaded and available
-if st.session_state.model_loaded:
-    model = st.session_state.model
-    processor = st.session_state.processor
-    device = st.session_state.device
-    
-    if model is None or processor is None:
-        st.error("❌ Model is not available. Please refresh the page.")
-        st.stop()
-else:
-    # If model failed to load, show error state
-    if st.session_state.load_error:
-        st.warning("⚠️ Model loading failed. The app may not be fully functional.")
-        st.info("Possible reasons:")
-        st.info("- Limited memory on the server")
-        st.info("- Network connectivity issues")
-        st.info("- Model download timeout")
-        st.info("\nTry refreshing the page in a few moments.")
-    st.stop()
 
 # File uploader
 st.subheader("📤 Upload Document")
-col1, col2 = st.columns([2, 1])
+uploaded_file = st.file_uploader(
+    "Choose an image file",
+    type=["png", "jpg", "jpeg", "bmp"],
+    help="Upload a scanned document or document image"
+)
 
-with col1:
-    uploaded_file = st.file_uploader(
-        "Choose an image file",
-        type=["png", "jpg", "jpeg", "bmp"],
-        help="Upload a scanned document or document image"
-    )
-
-with col2:
-    max_size = st.number_input(
-        "Max Image Size (MB)",
-        min_value=1,
-        max_value=50,
-        value=10,
-        help="Limit image size to manage memory"
-    )
-
-# Process uploaded file only if model is loaded
-if uploaded_file is not None and st.session_state.model_loaded:
+# Process uploaded file and load model on demand (lazy loading)
+if uploaded_file is not None:
+    # Load model only once when file is first uploaded
+    if not st.session_state.model_loaded:
+        with st.spinner("⏳ Loading AI model (this may take 2-3 minutes on first run)..."):
+            try:
+                logger.info("Lazy loading: Attempting to load model after file upload...")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                model, processor, device = load_model_and_processor()
+                
+                if model is not None and processor is not None:
+                    st.session_state.model = model
+                    st.session_state.processor = processor
+                    st.session_state.device = device
+                    st.session_state.model_loaded = True
+                    st.success("✅ Model loaded successfully!")
+                else:
+                    st.error("❌ Failed to load model. Please try again.")
+                    st.stop()
+            except Exception as e:
+                logger.error(f"Lazy load failed: {str(e)}", exc_info=True)
+                st.error(f"❌ Error loading model: {str(e)}")
+                st.info("💡 Try refreshing the page or uploading a different image.")
+                st.stop()
+    
+    # Access loaded model from session state
+    model = st.session_state.model
+    processor = st.session_state.processor
+    device = st.session_state.device
     # File size check
     file_size_mb = uploaded_file.size / (1024 * 1024)
-    if file_size_mb > max_size:
-        st.error(f"❌ File size ({file_size_mb:.2f}MB) exceeds limit ({max_size}MB)")
+    if file_size_mb > 50:
+        st.error(f"❌ File size ({file_size_mb:.2f}MB) exceeds limit (50MB)")
     else:
         try:
             image = Image.open(uploaded_file).convert("RGB")
@@ -396,9 +358,8 @@ if uploaded_file is not None and st.session_state.model_loaded:
         except Exception as e:
             logger.error(f"Image loading error: {str(e)}", exc_info=True)
             st.error(f"❌ Error loading image: {str(e)}")
-
-elif uploaded_file is not None and not st.session_state.model_loaded:
-    st.warning("⚠️ Please wait for the model to load before uploading a file.")
+else:
+    st.info("👆 Upload an image file to get started. The model will load on first use.")
 
 # Footer
 st.markdown("""---""")
