@@ -6,12 +6,18 @@ A Streamlit app that converts document images to Markdown using a fine-tuned Vis
 import streamlit as st
 import torch
 import gc
+import sys
+import logging
 from PIL import Image
 from pathlib import Path
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 from peft import PeftModel
 import io
 import time
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -96,45 +102,71 @@ with st.sidebar:
     """)
 
 # ============================================================================
-# MODEL LOADING (CACHED)
+# MODEL LOADING (CACHED WITH IMPROVED ERROR HANDLING)
 # ============================================================================
 @st.cache_resource
 def load_model_and_processor():
-    """Load the model and processor with quantization if specified."""
+    """Load the model and processor with robust error handling."""
     try:
-        # Clear memory
+        logger.info("Starting model and processor loading...")
+        
+        # Aggressive memory cleanup
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            logger.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
+        else:
+            logger.info("CUDA not available, using CPU")
         
-        # Determine device
+        # Determine device with fallback
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Using device: {device}")
         
-        # Load base model
+        # Load processor first (lighter weight)
+        logger.info(f"Loading processor from {MODEL_NAME}...")
+        processor = AutoProcessor.from_pretrained(
+            MODEL_NAME,
+            trust_remote_code=True,
+            timeout=120
+        )
+        logger.info("✓ Processor loaded successfully")
+        
+        # Load base model with optimizations
+        logger.info(f"Loading base model from {MODEL_NAME}...")
         model = Qwen2VLForConditionalGeneration.from_pretrained(
             MODEL_NAME,
             torch_dtype=torch.float32,
-            device_map=device,
+            device_map="cpu",  # Load on CPU first to avoid OOM
             trust_remote_code=True,
             low_cpu_mem_usage=True,
             attn_implementation="sdpa",
+            timeout=180
         )
+        logger.info("✓ Base model loaded successfully")
         
         # Load LoRA adapter
         if WEIGHTS_PATH.exists():
+            logger.info(f"Loading LoRA adapter from {WEIGHTS_PATH}...")
             model = PeftModel.from_pretrained(model, WEIGHTS_PATH)
             model.eval()
+            logger.info("✓ LoRA adapter loaded successfully")
+        else:
+            logger.warning(f"Weights path not found: {WEIGHTS_PATH}")
         
-        # Load processor
-        processor = AutoProcessor.from_pretrained(
-            MODEL_NAME,
-            trust_remote_code=True
-        )
+        # Move to device if CUDA available
+        if device == "cuda":
+            try:
+                model = model.to(device)
+                logger.info("✓ Model moved to GPU")
+            except RuntimeError as e:
+                logger.warning(f"Could not move model to GPU: {e}. Using CPU instead.")
+                device = "cpu"
         
+        logger.info("✓ All models loaded successfully")
         return model, processor, device
     
     except Exception as e:
-        st.error(f"❌ Model loading failed: {str(e)}")
+        logger.error(f"Model loading failed: {str(e)}", exc_info=True)
         return None, None, None
 
 # ============================================================================
@@ -143,9 +175,17 @@ def load_model_and_processor():
 def convert_image_to_markdown(image: Image.Image, model, processor, device) -> str:
     """Convert an image to Markdown using the fine-tuned model."""
     try:
+        logger.info("Starting inference...")
+        
         # Prepare the image
         if image.mode != "RGB":
             image = image.convert("RGB")
+        
+        # Resize image if too large
+        max_size = 1024
+        if image.size[0] > max_size or image.size[1] > max_size:
+            image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            logger.info(f"Image resized to {image.size}")
         
         # Prepare messages in ChatML format
         messages = [
@@ -159,6 +199,7 @@ def convert_image_to_markdown(image: Image.Image, model, processor, device) -> s
         ]
         
         # Process text
+        logger.info("Processing inputs...")
         text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = processor(
             text=[text_prompt],
@@ -169,25 +210,35 @@ def convert_image_to_markdown(image: Image.Image, model, processor, device) -> s
         
         # Move to device
         inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+        logger.info(f"Inputs moved to {device}")
         
         # Generate markdown
+        logger.info("Generating markdown...")
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
                 max_new_tokens=2048,
                 temperature=0.7,
                 top_p=0.9,
+                do_sample=True
             )
         
+        logger.info("Decoding output...")
         # Decode output
         markdown_text = processor.decode(
             output_ids[0],
             skip_special_tokens=True
         ).split("assistant\n")[-1].strip()
         
+        logger.info("✓ Inference complete")
         return markdown_text
     
     except Exception as e:
+        logger.error(f"Inference failed: {str(e)}", exc_info=True)
         raise Exception(f"Inference failed: {str(e)}")
 
 # ============================================================================
@@ -200,16 +251,42 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Load model
-model_status = st.empty()
-with model_status.container():
-    with st.spinner("🔄 Loading model (first time only)..."):
-        model, processor, device = load_model_and_processor()
+# Initialize session state for model
+if 'model_loaded' not in st.session_state:
+    st.session_state.model_loaded = False
+    st.session_state.model = None
+    st.session_state.processor = None
+    st.session_state.device = None
 
-if model is not None:
-    st.markdown('<div class="success-box">✅ Model loaded successfully!</div>', unsafe_allow_html=True)
-else:
-    st.error("Failed to load the model. Please check your setup.")
+# Load model with better error handling
+if not st.session_state.model_loaded:
+    st.info("⏳ Loading AI model for the first time (this may take 1-2 minutes)...")
+    with st.spinner("🔄 Loading model..."):
+        try:
+            model, processor, device = load_model_and_processor()
+            if model is not None and processor is not None:
+                st.session_state.model = model
+                st.session_state.processor = processor
+                st.session_state.device = device
+                st.session_state.model_loaded = True
+                st.success("✅ Model loaded successfully!")
+                st.rerun()
+            else:
+                st.error("❌ Failed to load model. Please check the logs and try again.")
+                st.stop()
+        except Exception as e:
+            logger.error(f"Model loading error: {e}", exc_info=True)
+            st.error(f"❌ Error loading model: {str(e)}")
+            st.info("💡 Try: refreshing the page, checking your internet connection, or using CPU mode")
+            st.stop()
+
+# Extract model components from session state
+model = st.session_state.model
+processor = st.session_state.processor
+device = st.session_state.device
+
+if model is None:
+    st.error("❌ Model is not available. Please refresh the page.")
     st.stop()
 
 # File uploader
