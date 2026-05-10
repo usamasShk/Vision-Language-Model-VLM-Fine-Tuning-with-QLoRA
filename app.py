@@ -102,67 +102,48 @@ with st.sidebar:
     """)
 
 # ============================================================================
-# MODEL LOADING (CACHED WITH IMPROVED ERROR HANDLING)
+# MODEL LOADING (CACHED WITH ERROR HANDLING)
 # ============================================================================
 @st.cache_resource
 def load_model_and_processor():
     """Load the model and processor with robust error handling."""
     try:
         logger.info("Starting model and processor loading...")
-        
-        # Aggressive memory cleanup
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            logger.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
-        else:
-            logger.info("CUDA not available, using CPU")
         
-        # Determine device with fallback
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cpu"  # Force CPU for Streamlit Cloud compatibility
         logger.info(f"Using device: {device}")
         
-        # Load processor first (lighter weight)
-        logger.info(f"Loading processor from {MODEL_NAME}...")
+        # Load processor with timeout
+        logger.info(f"Loading processor...")
         processor = AutoProcessor.from_pretrained(
             MODEL_NAME,
             trust_remote_code=True,
             timeout=120
         )
-        logger.info("✓ Processor loaded successfully")
+        logger.info("✓ Processor loaded")
         
         # Load base model with optimizations
-        logger.info(f"Loading base model from {MODEL_NAME}...")
+        logger.info(f"Loading base model...")
         model = Qwen2VLForConditionalGeneration.from_pretrained(
             MODEL_NAME,
             torch_dtype=torch.float32,
-            device_map="cpu",  # Load on CPU first to avoid OOM
+            device_map="cpu",
             trust_remote_code=True,
             low_cpu_mem_usage=True,
             attn_implementation="sdpa",
-            timeout=180
+            timeout=300
         )
-        logger.info("✓ Base model loaded successfully")
+        logger.info("✓ Base model loaded")
         
-        # Load LoRA adapter
+        # Load LoRA adapter if available
         if WEIGHTS_PATH.exists():
-            logger.info(f"Loading LoRA adapter from {WEIGHTS_PATH}...")
+            logger.info(f"Loading LoRA adapter...")
             model = PeftModel.from_pretrained(model, WEIGHTS_PATH)
             model.eval()
-            logger.info("✓ LoRA adapter loaded successfully")
-        else:
-            logger.warning(f"Weights path not found: {WEIGHTS_PATH}")
+            logger.info("✓ LoRA adapter loaded")
         
-        # Move to device if CUDA available
-        if device == "cuda":
-            try:
-                model = model.to(device)
-                logger.info("✓ Model moved to GPU")
-            except RuntimeError as e:
-                logger.warning(f"Could not move model to GPU: {e}. Using CPU instead.")
-                device = "cpu"
-        
-        logger.info("✓ All models loaded successfully")
+        logger.info("✓ All models ready")
         return model, processor, device
     
     except Exception as e:
@@ -257,36 +238,51 @@ if 'model_loaded' not in st.session_state:
     st.session_state.model = None
     st.session_state.processor = None
     st.session_state.device = None
+    st.session_state.load_error = None
 
-# Load model with better error handling
+# Load model with graceful error handling
 if not st.session_state.model_loaded:
-    st.info("⏳ Loading AI model for the first time (this may take 1-2 minutes)...")
-    with st.spinner("🔄 Loading model..."):
+    with st.spinner("⏳ Loading AI model for the first time (this may take 2-3 minutes)..."):
         try:
+            logger.info("Attempting to load model...")
             model, processor, device = load_model_and_processor()
+            
             if model is not None and processor is not None:
                 st.session_state.model = model
                 st.session_state.processor = processor
                 st.session_state.device = device
                 st.session_state.model_loaded = True
+                st.session_state.load_error = None
                 st.success("✅ Model loaded successfully!")
                 st.rerun()
             else:
-                st.error("❌ Failed to load model. Please check the logs and try again.")
-                st.stop()
+                st.session_state.load_error = "Model loading returned None"
+                st.error("❌ Failed to load model. Please try again later.")
         except Exception as e:
-            logger.error(f"Model loading error: {e}", exc_info=True)
-            st.error(f"❌ Error loading model: {str(e)}")
-            st.info("💡 Try: refreshing the page, checking your internet connection, or using CPU mode")
-            st.stop()
+            error_msg = str(e)
+            st.session_state.load_error = error_msg
+            logger.error(f"Exception during model loading: {error_msg}", exc_info=True)
+            st.error(f"❌ Error loading model: {error_msg}")
+            st.info("💡 This may be due to limited resources. Please refresh the page in a few moments.")
 
-# Extract model components from session state
-model = st.session_state.model
-processor = st.session_state.processor
-device = st.session_state.device
-
-if model is None:
-    st.error("❌ Model is not available. Please refresh the page.")
+# Check if model is loaded and available
+if st.session_state.model_loaded:
+    model = st.session_state.model
+    processor = st.session_state.processor
+    device = st.session_state.device
+    
+    if model is None or processor is None:
+        st.error("❌ Model is not available. Please refresh the page.")
+        st.stop()
+else:
+    # If model failed to load, show error state
+    if st.session_state.load_error:
+        st.warning("⚠️ Model loading failed. The app may not be fully functional.")
+        st.info("Possible reasons:")
+        st.info("- Limited memory on the server")
+        st.info("- Network connectivity issues")
+        st.info("- Model download timeout")
+        st.info("\nTry refreshing the page in a few moments.")
     st.stop()
 
 # File uploader
@@ -309,98 +305,100 @@ with col2:
         help="Limit image size to manage memory"
     )
 
-# Process uploaded file
-if uploaded_file is not None:
+# Process uploaded file only if model is loaded
+if uploaded_file is not None and st.session_state.model_loaded:
     # File size check
     file_size_mb = uploaded_file.size / (1024 * 1024)
     if file_size_mb > max_size:
         st.error(f"❌ File size ({file_size_mb:.2f}MB) exceeds limit ({max_size}MB)")
-        st.stop()
-    
-    # Load and display image
-    try:
-        image = Image.open(uploaded_file).convert("RGB")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("📸 Original Document")
-            st.image(image, use_column_width=True)
+    else:
+        try:
+            image = Image.open(uploaded_file).convert("RGB")
             
-            # Display image info
-            st.markdown(f"""
-            <div class="info-box">
-            <b>Image Info:</b><br>
-            Size: {image.size[0]} × {image.size[1]} px<br>
-            Format: {image.format}
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            st.subheader("✨ Converted Markdown")
+            col1, col2 = st.columns(2)
             
-            # Convert button
-            if st.button("🚀 Convert to Markdown", use_container_width=True):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+            with col1:
+                st.subheader("📸 Original Document")
+                st.image(image, use_column_width=True)
                 
-                try:
-                    # Conversion
-                    status_text.text("🔄 Converting image to Markdown...")
-                    progress_bar.progress(30)
-                    
-                    start_time = time.time()
-                    markdown_text = convert_image_to_markdown(image, model, processor, device)
-                    conversion_time = time.time() - start_time
-                    
-                    progress_bar.progress(100)
-                    status_text.text(f"✅ Conversion complete in {conversion_time:.2f}s")
-                    
-                    # Display markdown
-                    st.markdown("""---""")
-                    st.markdown(markdown_text)
-                    
-                    # Download buttons
-                    st.markdown("""---""")
-                    col_copy, col_download = st.columns(2)
-                    
-                    with col_copy:
-                        st.text_area(
-                            "Markdown Output",
-                            value=markdown_text,
-                            height=200,
-                            disabled=True,
-                            label_visibility="collapsed"
-                        )
-                    
-                    with col_download:
-                        st.download_button(
-                            label="📥 Download as .md",
-                            data=markdown_text,
-                            file_name=f"{uploaded_file.name.split('.')[0]}.md",
-                            mime="text/markdown",
-                            use_container_width=True
-                        )
+                # Display image info
+                st.markdown(f"""
+                <div class="info-box">
+                <b>Image Info:</b><br>
+                Size: {image.size[0]} × {image.size[1]} px<br>
+                Format: {image.format}
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col2:
+                st.subheader("✨ Converted Markdown")
+                
+                # Convert button
+                if st.button("🚀 Convert to Markdown", use_container_width=True):
+                    try:
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
                         
-                        # Also offer txt download
-                        st.download_button(
-                            label="📥 Download as .txt",
-                            data=markdown_text,
-                            file_name=f"{uploaded_file.name.split('.')[0]}.txt",
-                            mime="text/plain",
-                            use_container_width=True
-                        )
+                        status_text.text("🔄 Converting image to Markdown...")
+                        progress_bar.progress(30)
+                        
+                        start_time = time.time()
+                        markdown_text = convert_image_to_markdown(image, model, processor, device)
+                        conversion_time = time.time() - start_time
+                        
+                        progress_bar.progress(100)
+                        status_text.text(f"✅ Conversion complete in {conversion_time:.2f}s")
+                        
+                        # Display markdown
+                        st.markdown("""---""")
+                        st.markdown(markdown_text)
+                        
+                        # Download buttons
+                        st.markdown("""---""")
+                        col_copy, col_download = st.columns(2)
+                        
+                        with col_copy:
+                            st.text_area(
+                                "Markdown Output",
+                                value=markdown_text,
+                                height=200,
+                                disabled=True,
+                                label_visibility="collapsed"
+                            )
+                        
+                        with col_download:
+                            st.download_button(
+                                label="📥 Download as .md",
+                                data=markdown_text,
+                                file_name=f"{uploaded_file.name.split('.')[0]}.md",
+                                mime="text/markdown",
+                                use_container_width=True
+                            )
+                            
+                            # Also offer txt download
+                            st.download_button(
+                                label="📥 Download as .txt",
+                                data=markdown_text,
+                                file_name=f"{uploaded_file.name.split('.')[0]}.txt",
+                                mime="text/plain",
+                                use_container_width=True
+                            )
+                        
+                        progress_bar.empty()
+                        status_text.empty()
                     
-                    progress_bar.empty()
-                    status_text.empty()
-                
-                except Exception as e:
-                    st.error(f"❌ Conversion failed: {str(e)}")
-                    progress_bar.empty()
-                    status_text.empty()
-    
-    except Exception as e:
-        st.error(f"❌ Error loading image: {str(e)}")
+                    except Exception as e:
+                        logger.error(f"Conversion error: {str(e)}", exc_info=True)
+                        st.error(f"❌ Conversion failed: {str(e)}")
+                        progress_bar.empty()
+                        status_text.empty()
+        
+        except Exception as e:
+            logger.error(f"Image loading error: {str(e)}", exc_info=True)
+            st.error(f"❌ Error loading image: {str(e)}")
+
+elif uploaded_file is not None and not st.session_state.model_loaded:
+    st.warning("⚠️ Please wait for the model to load before uploading a file.")
 
 # Footer
 st.markdown("""---""")
