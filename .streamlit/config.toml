@@ -1,10 +1,9 @@
 [client]
 showErrorDetails = true
 toolbarMode = "viewer"
-logger.level = "debug"
 
 [logger]
-level = "debug"
+level = "info"
 
 [theme]
 primaryColor = "#1f77b4"
@@ -20,31 +19,3 @@ runOnSave = false
 maxUploadSize = 50
 enableXsrfProtection = true
 enableCORS = false
-
-# Increase health check timeout for model loading
-[healthz]
-enabled = false
-
-# Session settings
-[client.logger]
-level = "debug"
-
-# Memory and performance
-[client.showErrorDetails]
-value = true
-
-# Timeout settings
-[server.fileWatcherType]
-type = "polling"
-pollInterval = 1.0
-
-# SSL settings (for production)
-[server.sslCertFile]
-value = ""
-
-[server.sslKeyFile]
-value = ""
-
-# Increase session timeout
-[client.sessionState]
-maximumEntries = 1000
